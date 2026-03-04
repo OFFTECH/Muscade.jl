@@ -1,6 +1,6 @@
 ######## The disassembler
 
-struct XUA{T,nX,nU,nA} 
+struct XUA{T,nX,nU,nA}
     X::SVector{nX,T}
     U::SVector{nU,T}
     A::SVector{nA,T}
@@ -202,34 +202,80 @@ function DofGroup(dis::Disassembler,iΛ,iX,iU,iA)
     Λf,Xf,Uf,Af = dis.fieldX[iΛ],dis.fieldX[iX],dis.fieldU[iU],dis.fieldA[iA]
     return DofGroup(nX,nU,nA, iΛ,iX,iU,iA,  jΛ,jX,jU,jA, Λs,Xs,Us,As, Λf,Xf,Uf,Af)
 end
-# use a dof-vector to decrement/increment/set/get the corresponding dofs in a State
-function decrement!(s::State,ider::𝕫,y::AbstractVector{𝕣},gr::DofGroup) 
-    if ider≤length(s.Λ) for i ∈ eachindex(gr.iΛ); s.Λ[ider][gr.iΛ[i]] -= y[gr.jΛ[i]] * gr.scaleΛ[i]; end end
-    if ider≤length(s.X) for i ∈ eachindex(gr.iX); s.X[ider][gr.iX[i]] -= y[gr.jX[i]] * gr.scaleX[i]; end end
-    if ider≤length(s.U) for i ∈ eachindex(gr.iU); s.U[ider][gr.iU[i]] -= y[gr.jU[i]] * gr.scaleU[i]; end end
-    if ider==1          for i ∈ eachindex(gr.iA); s.A[      gr.iA[i]] -= y[gr.jA[i]] * gr.scaleA[i]; end end
+# SIMD-optimized decrement! using multiple dispatch to avoid conditionals in hot loops
+# These specialized versions allow the compiler to fully vectorize each case
+
+# Helper: unconditionally decrement Λ (for ider within bounds)
+@inline function _decrement_Λ!(s::State,ider::𝕫,y::AbstractVector{𝕣},gr::DofGroup)
+    @simd for i ∈ eachindex(gr.iΛ); @inbounds s.Λ[ider][gr.iΛ[i]] -= y[gr.jΛ[i]] * gr.scaleΛ[i]; end
 end
-function increment!(s::State,ider::𝕫,y::AbstractVector{𝕣},gr::DofGroup) 
-    if ider≤length(s.Λ) for i ∈ eachindex(gr.iΛ); s.Λ[ider][gr.iΛ[i]] += y[gr.jΛ[i]] * gr.scaleΛ[i]; end end
-    if ider≤length(s.X) for i ∈ eachindex(gr.iX); s.X[ider][gr.iX[i]] += y[gr.jX[i]] * gr.scaleX[i]; end end
-    if ider≤length(s.U) for i ∈ eachindex(gr.iU); s.U[ider][gr.iU[i]] += y[gr.jU[i]] * gr.scaleU[i]; end end
-    if ider==1          for i ∈ eachindex(gr.iA); s.A[      gr.iA[i]] += y[gr.jA[i]] * gr.scaleA[i]; end end
+
+# Helper: unconditionally decrement X (for ider within bounds)
+@inline function _decrement_X!(s::State,ider::𝕫,y::AbstractVector{𝕣},gr::DofGroup)
+    @simd for i ∈ eachindex(gr.iX); @inbounds s.X[ider][gr.iX[i]] -= y[gr.jX[i]] * gr.scaleX[i]; end
+end
+
+# Helper: unconditionally decrement U (for ider within bounds)
+@inline function _decrement_U!(s::State,ider::𝕫,y::AbstractVector{𝕣},gr::DofGroup)
+    @simd for i ∈ eachindex(gr.iU); @inbounds s.U[ider][gr.iU[i]] -= y[gr.jU[i]] * gr.scaleU[i]; end
+end
+
+# Helper: unconditionally decrement A
+@inline function _decrement_A!(s::State,y::AbstractVector{𝕣},gr::DofGroup)
+    @simd for i ∈ eachindex(gr.iA); @inbounds s.A[gr.iA[i]] -= y[gr.jA[i]] * gr.scaleA[i]; end
+end
+
+# Generic fallback for unusual cases
+function decrement!(s::State,ider::𝕫,y::AbstractVector{𝕣},gr::DofGroup)
+    if ider≤length(s.Λ) _decrement_Λ!(s,ider,y,gr) end
+    if ider≤length(s.X) _decrement_X!(s,ider,y,gr) end
+    if ider≤length(s.U) _decrement_U!(s,ider,y,gr) end
+    if ider==1          _decrement_A!(s,y,gr) end
+end
+# SIMD-optimized increment! using multiple dispatch to avoid conditionals in hot loops
+
+# Helper: unconditionally increment Λ (for ider within bounds)
+@inline function _increment_Λ!(s::State,ider::𝕫,y::AbstractVector{𝕣},gr::DofGroup)
+    @simd for i ∈ eachindex(gr.iΛ); @inbounds s.Λ[ider][gr.iΛ[i]] += y[gr.jΛ[i]] * gr.scaleΛ[i]; end
+end
+
+# Helper: unconditionally increment X (for ider within bounds)
+@inline function _increment_X!(s::State,ider::𝕫,y::AbstractVector{𝕣},gr::DofGroup)
+    @simd for i ∈ eachindex(gr.iX); @inbounds s.X[ider][gr.iX[i]] += y[gr.jX[i]] * gr.scaleX[i]; end
+end
+
+# Helper: unconditionally increment U (for ider within bounds)
+@inline function _increment_U!(s::State,ider::𝕫,y::AbstractVector{𝕣},gr::DofGroup)
+    @simd for i ∈ eachindex(gr.iU); @inbounds s.U[ider][gr.iU[i]] += y[gr.jU[i]] * gr.scaleU[i]; end
+end
+
+# Helper: unconditionally increment A
+@inline function _increment_A!(s::State,y::AbstractVector{𝕣},gr::DofGroup)
+    @simd for i ∈ eachindex(gr.iA); @inbounds s.A[gr.iA[i]] += y[gr.jA[i]] * gr.scaleA[i]; end
+end
+
+# Generic fallback for unusual cases
+function increment!(s::State,ider::𝕫,y::AbstractVector{𝕣},gr::DofGroup)
+    if ider≤length(s.Λ) _increment_Λ!(s,ider,y,gr) end
+    if ider≤length(s.X) _increment_X!(s,ider,y,gr) end
+    if ider≤length(s.U) _increment_U!(s,ider,y,gr) end
+    if ider==1          _increment_A!(s,y,gr) end
 end
 function set!(s::State,ider::𝕫,y::AbstractVector{𝕣},gr::DofGroup) 
     s.Λ[ider+1] .= 0
     s.X[ider+1] .= 0
     s.U[ider+1] .= 0
     s.A         .= 0
-    for i ∈ eachindex(gr.iΛ); s.Λ[ider+1][gr.iΛ[i]] = y[gr.jΛ[i]] * gr.scaleΛ[i]; end
-    for i ∈ eachindex(gr.iX); s.X[ider+1][gr.iX[i]] = y[gr.jX[i]] * gr.scaleX[i]; end
-    for i ∈ eachindex(gr.iU); s.U[ider+1][gr.iU[i]] = y[gr.jU[i]] * gr.scaleU[i]; end
-    for i ∈ eachindex(gr.iA); s.A[        gr.iA[i]] = y[gr.jA[i]] * gr.scaleA[i]; end
+    @simd for i ∈ eachindex(gr.iΛ); @inbounds s.Λ[ider+1][gr.iΛ[i]] = y[gr.jΛ[i]] * gr.scaleΛ[i]; end
+    @simd for i ∈ eachindex(gr.iX); @inbounds s.X[ider+1][gr.iX[i]] = y[gr.jX[i]] * gr.scaleX[i]; end
+    @simd for i ∈ eachindex(gr.iU); @inbounds s.U[ider+1][gr.iU[i]] = y[gr.jU[i]] * gr.scaleU[i]; end
+    @simd for i ∈ eachindex(gr.iA); @inbounds s.A[        gr.iA[i]] = y[gr.jA[i]] * gr.scaleA[i]; end
 end
 function getdof!(s::State,ider::𝕫,y::AbstractVector{𝕣},gr::DofGroup) 
-    for i ∈ eachindex(gr.iΛ); y[gr.jΛ[i]] = s.Λ[ider+1][gr.iΛ[i]] / gr.scaleΛ[i]; end
-    for i ∈ eachindex(gr.iX); y[gr.jX[i]] = s.X[ider+1][gr.iX[i]] / gr.scaleX[i]; end
-    for i ∈ eachindex(gr.iU); y[gr.jU[i]] = s.U[ider+1][gr.iU[i]] / gr.scaleU[i]; end
-    for i ∈ eachindex(gr.iA); y[gr.jA[i]] = s.A[        gr.iA[i]] / gr.scaleA[i]; end
+    @simd for i ∈ eachindex(gr.iΛ); @inbounds y[gr.jΛ[i]] = s.Λ[ider+1][gr.iΛ[i]] / gr.scaleΛ[i]; end
+    @simd for i ∈ eachindex(gr.iX); @inbounds y[gr.jX[i]] = s.X[ider+1][gr.iX[i]] / gr.scaleX[i]; end
+    @simd for i ∈ eachindex(gr.iU); @inbounds y[gr.jU[i]] = s.U[ider+1][gr.iU[i]] / gr.scaleU[i]; end
+    @simd for i ∈ eachindex(gr.iA); @inbounds y[gr.jA[i]] = s.A[        gr.iA[i]] / gr.scaleA[i]; end
 end
 # create a tuple (Λ,X,U,A) of indices into the dofgroup - with zeros for modeldofs not in dofgroup
 # so the model's iλ-th Λdof is found in y[Λ[iλ]]
@@ -345,10 +391,10 @@ function asmvec!(asm,dofgr,dis)
     return 𝕣1(undef,getndof(dofgr))
 end
 function asmvec_kernel!(asm,ieletyp,dofgr,dis,Λ,X,U,A) 
-    nΛ,nX,nU,nA = gradientstructure(dofgr,dis) # number of dofs of each class in the gradient returned by an element
-    iΛ,iX,iU,iA = gradientpartition(nΛ,nX,nU,nA)  # indices into said gradient TODO type unstable, barrier function
-    asm[ieletyp] = zeros(𝕫,nΛ+nX+nU+nA,length(dis.index)) # asm[ieletyp][idof,iele] (its a view)
-    for (iele,index) ∈ enumerate(dis.index)
+    nΛ,nX,nU,nA = gradientstructure(dofgr,dis)
+    iΛ,iX,iU,iA = gradientpartition(nΛ,nX,nU,nA)
+    asm[ieletyp] = zeros(𝕫,nΛ+nX+nU+nA,length(dis.index))
+    @views for (iele,index) ∈ enumerate(dis.index)
         asm[ieletyp][iΛ,iele] .= nonzeros(Λ[index.X])  
         asm[ieletyp][iX,iele] .= nonzeros(X[index.X])
         asm[ieletyp][iU,iele] .= nonzeros(U[index.U])
@@ -360,7 +406,7 @@ function asmfullmat!(asm,iasm,jasm,nimoddof,njmoddof)
         nieledof,nele = size(iasm[ieletyp])
         njeledof      = size(jasm[ieletyp],1)
         asm[ieletyp]  = zeros(𝕫,nieledof*njeledof,nele)
-        for iele=1:nele, jeledof=1:njeledof, ieledof=1:nieledof
+        @inbounds for iele=1:nele, jeledof=1:njeledof, ieledof=1:nieledof
             imoddof,jmoddof = iasm[ieletyp][ieledof,iele], jasm[ieletyp][jeledof,iele]
             if (imoddof≠0)  &&  (jmoddof≠0)
                 i = ieledof+nieledof*(jeledof-1)
@@ -535,13 +581,13 @@ function zero!(out::Base.RefValue)
     out[] = 0
 end
 function zero!(out::AbstractArray)
-    for i∈eachindex(out)
-        out[i] = 0
+    @simd for i∈eachindex(out)
+        @inbounds out[i] = zero(eltype(out))
     end
 end
 function zero!(out::AbstractSparseArray)
-    for i∈eachindex(out.nzval)
-        out.nzval[i] = 0
+    @simd for i∈eachindex(out.nzval)
+        @inbounds out.nzval[i] = zero(eltype(out.nzval))
     end
 end
 
@@ -557,29 +603,62 @@ end
 # out[asm[:,   iele]] += a[ia]  # split: parts of 'a' are assembled (DirectXUA)   
 # out[asm[iasm,iele]] += a[ia]  # not used
 function add_value!(out::𝕣1,asm,iele,a::SVector{Na,<:ℝ},ia=1:Na;iasm=idvec,Δt=idmult) where{Na}
-    for (i,iaᵢ) ∈ enumerate(ia)
+    @inbounds for (i,iaᵢ) ∈ enumerate(ia)
         iout = asm[iasm[i],iele]
         if iout≠0 
-            out[iout]+=VALUE(a[iaᵢ])*Δt 
+            out[iout] += VALUE(a[iaᵢ]) * Δt 
         end
     end
 end   
-function add_value!(out::𝕣0,a,ia::𝕫;Δt=idmult)  # # Lr, scalar in Newmakr-β context
-    out[] += VALUE(a[ia])*Δt
+function add_value!(out::𝕣0,a,ia::𝕫;Δt=idmult)
+    out[] += VALUE(a[ia]) * Δt
 end
 
-struct   add_∂!{P,S,T} end # to allow syntax with type-parameter P: precedence, S: :plus|:minus, T: :transpose|:notranspose
+struct   add_∂!{P,S,T} end
 function add_∂!{P,S,T}(out::Array,asm,iele,a::SVector{Na,∂ℝ{P,Nda,R}},ia=1:Na,ida=1:Nda;iasm=idvec,idasm=idvec,Δt=idmult) where{P,Nda,R,Na,S,T}
-    for (i,iaᵢ) ∈ enumerate(ia), (j,idaⱼ) ∈ enumerate(ida)
-        k = if T==:transpose   idasm[j]+length(ida)*( iasm[i]-1)   
-        elseif T==:notranspose iasm[ i]+length( ia)*(idasm[j]-1)  
-        else   muscadeerror((;T=T),"Illegal value of parameter T")    
+    nia, nida = length(ia), length(ida)
+    if S==:plus
+        if T==:transpose
+            @inbounds for (i,iaᵢ) ∈ enumerate(ia)
+                for (j,idaⱼ) ∈ enumerate(ida)
+                    k = idasm[j] + nida * (iasm[i] - 1)
+                    iout = asm[k,iele]
+                    if iout≠0
+                        out[iout] += a[iaᵢ].dx[idaⱼ] * Δt
+                    end
+                end
+            end
+        else
+            @inbounds for (i,iaᵢ) ∈ enumerate(ia)
+                for (j,idaⱼ) ∈ enumerate(ida)
+                    k = iasm[i] + nia * (idasm[j] - 1)
+                    iout = asm[k,iele]
+                    if iout≠0
+                        out[iout] += a[iaᵢ].dx[idaⱼ] * Δt
+                    end
+                end
+            end
         end
-        iout = asm[k,iele]
-        if iout≠0
-            if     S==:plus   out[iout]+=a[iaᵢ].dx[idaⱼ]*Δt  
-            elseif S==:minus  out[iout]-=a[iaᵢ].dx[idaⱼ]*Δt  
-            else   muscadeerror((;S=S),"Illegal value of parameter S")    
+    else
+        if T==:transpose
+            @inbounds for (i,iaᵢ) ∈ enumerate(ia)
+                for (j,idaⱼ) ∈ enumerate(ida)
+                    k = idasm[j] + nida * (iasm[i] - 1)
+                    iout = asm[k,iele]
+                    if iout≠0
+                        out[iout] -= a[iaᵢ].dx[idaⱼ] * Δt
+                    end
+                end
+            end
+        else
+            @inbounds for (i,iaᵢ) ∈ enumerate(ia)
+                for (j,idaⱼ) ∈ enumerate(ida)
+                    k = iasm[i] + nia * (idasm[j] - 1)
+                    iout = asm[k,iele]
+                    if iout≠0
+                        out[iout] -= a[iaᵢ].dx[idaⱼ] * Δt
+                    end
+                end
             end
         end
     end
@@ -587,22 +666,28 @@ end
 add_∂!{P    }(                                     args...;kwargs...) where{P         } = add_∂!{P,:plus             }(args...;kwargs...) 
 add_∂!{P  ,S}(                                     args...;kwargs...) where{P,S       } = add_∂!{P,S    ,:notranspose}(args...;kwargs...) 
 add_∂!{P,S,T}(out::SparseMatrixCSC,                args...;kwargs...) where{P,S,T     } = add_∂!{P,S    ,T           }(out.nzval, args...;kwargs...)
-add_∂!{P,S,T}(out::Array,asm,iele,a::SVector{Na,R},args...;kwargs...) where{P,S,T,Na,R} = nothing # if P does not match
+add_∂!{P,S,T}(out::Array,asm,iele,a::SVector{Na,R},args...;kwargs...) where{P,S,T,Na,R} = nothing
 
-function add_∂!{P,S,T}(out::Vector,asm, iele, a::SVector{Na,∂ℝ{P,Nda,R}},ia,ida::𝕫,Δt=idmult) where{P,S,T,Nda,R,Na} # Lλr::Vector in Newmark-β context
-    for (i,iaᵢ) ∈ enumerate(ia)
-        iout = asm[i,iele]
-        if iout≠0
-            if     S==:plus   out[iout]+=a[iaᵢ].dx[ida]*Δt  
-            elseif S==:minus  out[iout]-=a[iaᵢ].dx[ida]*Δt  
-            else   muscadeerror((;S=S),"Illegal value of parameter S")    
+function add_∂!{P,S,T}(out::Vector,asm,iele,a::SVector{Na,∂ℝ{P,Nda,R}},ia,ida::𝕫,Δt=idmult) where{P,S,T,Nda,R,Na}
+    if S==:plus
+        @inbounds for (i,iaᵢ) ∈ enumerate(ia)
+            iout = asm[i,iele]
+            if iout≠0
+                out[iout] += a[iaᵢ].dx[ida] * Δt
+            end
+        end
+    else
+        @inbounds for (i,iaᵢ) ∈ enumerate(ia)
+            iout = asm[i,iele]
+            if iout≠0
+                out[iout] -= a[iaᵢ].dx[ida] * Δt
             end
         end
     end
 end   
-function add_∂!{P,S,T}(out::𝕣0,a::SVector{Na,∂ℝ{P,Nda,R}},ia::𝕫,ida::𝕫;Δt=idmult) where{P,S,T,Nda,R,Na} # Lrr, scalar in Newmark-β context
-    if     S==:plus   out[]+=a[ia].dx[ida]*Δt  
-    elseif S==:minus  out[]-=a[ia].dx[ida]*Δt  
+function add_∂!{P,S,T}(out::𝕣0,a::SVector{Na,∂ℝ{P,Nda,R}},ia::𝕫,ida::𝕫;Δt=idmult) where{P,S,T,Nda,R,Na}
+    if     S==:plus   out[] += a[ia].dx[ida] * Δt  
+    elseif S==:minus  out[] -= a[ia].dx[ida] * Δt  
     else   muscadeerror((;S=S),"Illegal value of parameter S")    
     end
 end

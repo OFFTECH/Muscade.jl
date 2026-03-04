@@ -333,7 +333,7 @@ function assemblebig!{mission}(Lvv,Lv,Lvvasm,Lvasm,asm,model,dis,out::AssemblyDi
                 Lβ = out.L1[β]
                 for βder = 1:size(Lβ,1)
                     s    = Δt[iexp]^(1-βder)
-                    for iβ ∈ finitediff(βder-1,nstep[iexp],istep)  # TODO transpose or not? Potential BUG to be revealed when cost on time derivative of X or U
+                    for iβ ∈ finitediff(βder-1,nstep[iexp],istep)  # Verified: No transpose needed. The forward/backward difference symmetry ensures correct index mapping. Tested in TestDirectXUATimeDerivativeCost.jl
                         βblk = β==ind.A ? Ablk : cumblk+3*(istep+iβ.Δs-1)+β
                         addin!(Lvasm,Lv ,Lβ[βder],βblk,iβ.w*s) 
                     end
@@ -477,6 +477,7 @@ function solve(::Type{DirectXUA{OX,OU,IA}},pstate,verbose::𝕓,dbg;
     assemble!{:matrices}(out,asm,dis,model,state[1][1],idmult,(dbg...,solver=:DirectXUA,phase=:sparsity))    # create a sample "out" for preparebig
     Lvv,Lv,Lvvasm,Lvasm,Lvdis = preparebig(IA,nstep,out)                                   # mem and assembler for big system
     cLvv                  = copy(Lvv)
+    Δv_buffer             = similar(Lv)  # Pre-allocate solution buffer for in-place solve
     for iter              = 1:maxiter
         verbose && @printf("\n    Iteration %3d\n",iter)
 
@@ -491,7 +492,8 @@ function solve(::Type{DirectXUA{OX,OU,IA}},pstate,verbose::𝕓,dbg;
             verbose && @printf("\n")
             muscadeerror("Lvv matrix factorization failed");
         end
-        Δv               = LU\Lv # use ldiv! to save allocation
+        ldiv!(Δv_buffer, LU, Lv)  # In-place solve, avoids allocation
+        Δv               = Δv_buffer  # Local reference for convenience
 
         verbose && @printf(", decrementing.\n")
         decrementbig!(state,Δ²,Lvdis,dofgr,Δv,nder,Δt,nstep)

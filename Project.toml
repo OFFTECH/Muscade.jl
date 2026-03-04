@@ -1,10 +1,15 @@
 name = "Muscade"
 uuid = "93488820-1883-11ed-0c34-05177b029e4d"
-authors = ["Philippe Maincon <philippe.maincon@sintef.no>","Thomas Sauder <thomas.sauder@sintef.no>"]
 version = "0.7.0"
+authors = ["Philippe Maincon <philippe.maincon@sintef.no>", "Thomas Sauder <thomas.sauder@sintef.no>"]
 
 [deps]
+BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
 GLMakie = "e9467ef8-e4e7-5192-8a1a-b1aee30e663a"
+Interpolations = "a98d9a8b-a2ab-59e6-89dd-64a1c18fca59"
+JuliaFormatter = "98e50ef6-434e-11e9-1051-2b60c6c9e899"
 KrylovKit = "0b1a1467-8014-51b9-945f-bf0ae24f4b77"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 MacroTools = "1914dd2f-81c6-5fcd-8719-6d5c9610ff09"
@@ -15,10 +20,15 @@ SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 
 [compat]
+BenchmarkTools = "1.6.3"
+CSV = "0.10.16"
+DataFrames = "1.8.1"
+GLMakie = "0.13"
+Interpolations = "0.16.2"
+JuliaFormatter = "2.3.0"
+KrylovKit = "0.9"
 MacroTools = "0.5"
 SparseArrays = "1"
 SpecialFunctions = "2"
 StaticArrays = "1"
-GLMakie = "0.13"
-KrylovKit = "0.9"
 julia = "1.11"

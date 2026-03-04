@@ -14,21 +14,29 @@ Newmarkβcoefficients{1}(Δt,_,γ)          = Newmarkβcoefficients{1}(1/(γ*Δt
 Newmarkβcoefficients{2}(Δt,β,γ)          = Newmarkβcoefficients{2}(γ/(β*Δt),γ/β ,(γ/2β-1)*Δt,1/(β*Δt^2),1/(β*Δt),1/2β,Δt)
 Newmarkβcoefficients{O}(      ) where{O} = Newmarkβcoefficients{O}(0.      ,0.  ,0.         ,0.        ,0.      ,0.  ,0.)
 
-mutable struct AssemblySweepX{OX,Tλ,Tλx} <: Assembly
-    # up
-    Lλ        :: Tλ                
-    Lλx       :: Tλx
-    # down
-    c         :: Newmarkβcoefficients{OX}
-end   
+mutable struct AssemblySweepX{OX,Tλ,Tλx,TΔx,Tbuf,Tthreadbuf} <: Assembly
+    Lλ            :: Tλ
+    Lλx           :: Tλx
+    c             :: Newmarkβcoefficients{OX}
+    Δx_buffer     :: TΔx
+    buffer        :: Tbuf
+    thread_buffers:: Tthreadbuf
+end
 function prepare(::Type{AssemblySweepX{OX}},model,dis) where{OX}
-    Xdofgr             = allXdofs(model,dis)  # dis: the model's disassembler
+    Xdofgr             = allXdofs(model,dis)
     ndof               = getndof(Xdofgr)
     narray,neletyp     = 2,getneletyp(model)
-    asm                = Matrix{𝕫2}(undef,narray,neletyp)  # asm[iarray,ieletyp][ieledof,iele]
-    Lλ                 = asmvec!(view(asm,1,:),Xdofgr,dis) 
-    Lλx                = asmmat!(view(asm,2,:),view(asm,1,:),view(asm,1,:),ndof,ndof) 
-    out                = AssemblySweepX{OX,typeof(Lλ),typeof(Lλx)}(Lλ,Lλx,Newmarkβcoefficients{OX}()) 
+    asm                = Matrix{𝕫2}(undef,narray,neletyp)
+    Lλ                 = asmvec!(view(asm,1,:),Xdofgr,dis)
+    Lλx                = asmmat!(view(asm,2,:),view(asm,1,:),view(asm,1,:),ndof,ndof)
+    Δx_buffer          = similar(Lλ)
+    buffer             = ntuple(i->𝕣1(undef,ndof), 6)
+    nthreads           = Threads.maxthreadid()
+    thread_buffers     = [ThreadLocalAssemblySweepX{OX,typeof(Lλ),typeof(Lλx)}(
+                            similar(Lλ), similar(Lλx), Newmarkβcoefficients{OX}()) 
+                         for _ in 1:nthreads]
+    out                = AssemblySweepX{OX,typeof(Lλ),typeof(Lλx),typeof(Δx_buffer),typeof(buffer),typeof(thread_buffers)}(
+                            Lλ,Lλx,Newmarkβcoefficients{OX}(),Δx_buffer,buffer,thread_buffers)
     return out,asm,Xdofgr
 end
 function zero!(out::AssemblySweepX) 
@@ -95,7 +103,161 @@ function addin!{Both}(out::AssemblySweepX{0},asm,iele,scale,eleobj,Λ,X::NTuple{
     add_∂!{1}( out.Lλx,asm[2],iele,Lλ)
 end
 
-struct   Newmarkβdecrement!{OX} end
+# ============================================================
+# Thread-Local Assembly Support for Parallelization
+# ============================================================
+
+"""
+Thread-local assembly buffer for parallel assembly of AssemblySweepX.
+Mimics the AssemblySweepX interface for use with addin! functions.
+"""
+struct ThreadLocalAssemblySweepX{OX,Tλ,Tλx}
+    Lλ  :: Tλ
+    Lλx :: Tλx
+    c   :: Newmarkβcoefficients{OX}
+end
+
+function ThreadLocalAssemblySweepX(out::AssemblySweepX{OX}) where {OX}
+    Lλ_local  = similar(out.Lλ)
+    Lλx_local = similar(out.Lλx)
+    return ThreadLocalAssemblySweepX{OX,typeof(Lλ_local),typeof(Lλx_local)}(
+        Lλ_local, Lλx_local, out.c)
+end
+
+function zero!(buf::ThreadLocalAssemblySweepX)
+    zero!(buf.Lλ)
+    zero!(buf.Lλx)
+end
+
+for OX_val in (0, 1, 2)
+    for mission_val in (:step, :iter)
+        @eval function addin!{$(QuoteNode(mission_val))}(out::ThreadLocalAssemblySweepX{$OX_val}, asm, iele, scale, eleobj, Λ, X::NTuple{Nxder,<:SVector{Nx}}, U, A, t, Δt, SP, dbg) where {Nxder,Nx}
+            addin!{$(QuoteNode(mission_val))}(out.c, out.Lλ, out.Lλx, asm, iele, scale, eleobj, Λ, X, U, A, t, Δt, SP, dbg)
+        end
+    end
+end
+
+function addin!{:step}(c::Newmarkβcoefficients{2}, Lλ, Lλx, asm, iele, scale, eleobj, Λ, X::NTuple{Nxder,<:SVector{Nx}}, U, A, t, Δt, SP, dbg) where{Nxder,Nx}
+    a₁,a₂,a₃,b₁,b₂,b₃ = c.a₁,c.a₂,c.a₃,c.b₁,c.b₂,c.b₃
+    x,x′,x″    = ∂0(X),∂1(X),∂2(X)
+    δX,δr      = reδ{1}((;X=x,r=0.),(;X=scale.X,r=1.))
+    a          = a₂*x′ + a₃*x″
+    b          = b₂*x′ + b₃*x″
+    vx         = x  +    δX
+    vx′        = x′ + a₁*δX + a*δr 
+    vx″        = x″ + b₁*δX + b*δr
+    Lλ_el,FB   = getresidual(eleobj,(vx,vx′,vx″),U,A,t,SP,dbg)
+    Lλ_el      = Lλ_el .* scale.X
+    add_value!(       Lλ ,asm[1],iele,Lλ_el             )
+    add_∂!{1,:minus}( Lλ ,asm[1],iele,Lλ_el,1:Nx,(Nx+1,))
+    add_∂!{1       }( Lλx,asm[2],iele,Lλ_el,1:Nx,1:Nx   )
+end
+
+function addin!{:iter}(c::Newmarkβcoefficients{2}, Lλ, Lλx, asm, iele, scale, eleobj, Λ, X::NTuple{Nxder,<:SVector{Nx}}, U, A, t, Δt, SP, dbg) where{Nxder,Nx} 
+    a₁,b₁      = c.a₁,c.b₁
+    δX         = δ{1,Nx,𝕣}(scale.X)
+    Lλ_el,FB   = getresidual(eleobj,(∂0(X)+δX, ∂1(X)+a₁*δX, ∂2(X)+b₁*δX),U,A,t,SP,dbg)
+    Lλ_el      = Lλ_el .* scale.X
+    add_value!(Lλ ,asm[1],iele,Lλ_el          )
+    add_∂!{1}( Lλx,asm[2],iele,Lλ_el,1:Nx,1:Nx)
+end
+
+function addin!{:step}(c::Newmarkβcoefficients{1}, Lλ, Lλx, asm, iele, scale, eleobj, Λ, X::NTuple{Nxder,<:SVector{Nx}}, U, A, t, Δt, SP, dbg) where{Nxder,Nx}
+    a₁,a₂      = c.a₁,c.a₂
+    x,x′       = ∂0(X),∂1(X)
+    δX,δr      = reδ{1}((;X=x,r=0.),(;X=scale.X,r=1.))
+    a          = a₂*x′
+    vx         = x  +    δX   
+    vx′        = x′ + a₁*δX + a*δr  
+    Lλ_el,FB   = getresidual(eleobj,(vx,vx′),U,A,t,SP,dbg)
+    Lλ_el      = Lλ_el .* scale.X
+    add_value!(Lλ ,asm[1],iele,Lλ_el                    )
+    add_∂!{1,:minus}( Lλ ,asm[1],iele,Lλ_el,1:Nx,(Nx+1,))
+    add_∂!{1}( Lλx,asm[2],iele,Lλ_el,1:Nx,1:Nx          )
+end
+
+function addin!{:iter}(c::Newmarkβcoefficients{1}, Lλ, Lλx, asm, iele, scale, eleobj, Λ, X::NTuple{Nxder,<:SVector{Nx}}, U, A, t, Δt, SP, dbg) where{Nxder,Nx}
+    a₁         = c.a₁
+    δX         = δ{1,Nx,𝕣}(scale.X)
+    Lλ_el,FB   = getresidual(eleobj,(∂0(X)+δX, ∂1(X)+a₁*δX),U,A,t,SP,dbg)
+    Lλ_el      = Lλ_el .* scale.X
+    add_value!(Lλ ,asm[1],iele,Lλ_el           )
+    add_∂!{1}( Lλx,asm[2],iele,Lλ_el,1:Nx,1:Nx )
+end
+
+for OX_val in (0, 1, 2)
+    for mission_val in (:step, :iter)
+        @eval addin!{$(QuoteNode(mission_val))}(out::ThreadLocalAssemblySweepX{$OX_val}, asm, iele, scale, eleobj, Λ, X::NTuple{Nxder,<:SVector{0}}, U, A, t, Δt, SP, dbg) where {Nxder} = return
+    end
+end
+
+"""
+Reduce (sum) thread-local buffers into the main assembly output.
+"""
+function reduce_thread_local!(dst::AssemblySweepX, srcs::Vector{<:ThreadLocalAssemblySweepX})
+    for src in srcs
+        dst.Lλ .+= src.Lλ
+        dst.Lλx.nzval .+= src.Lλx.nzval
+    end
+end
+
+"""
+Minimum number of elements per element type to justify threading overhead.
+"""
+const MIN_ELEMENTS_FOR_THREADING = 50
+
+"""
+Specialized threaded assembly for AssemblySweepX.
+Threads over elements within each element type, using thread-local buffers.
+"""
+function assemble_!{mission}(
+    out::AssemblySweepX{OX}, asm, dis::EletypDisassembler{nX,nU,nA}, 
+    eleobj::Vector, state::State{nΛder,nXder,nUder}, t, Δt, SP, dbg
+) where{mission,OX,nΛder,nXder,nUder,nX,nU,nA}
+    nele = length(eleobj)
+    
+    if nele < MIN_ELEMENTS_FOR_THREADING
+        for iele = 1:nele
+            index = dis.index[iele]
+            Λe = NTuple{nΛder}(λ[index.X] for λ∈state.Λ)
+            Xe = NTuple{nXder}(x[index.X] for x∈state.X)
+            Ue = NTuple{nUder}(u[index.U] for u∈state.U)
+            Ae = state.A[index.A]
+            addin!{mission}(out, asm, iele, dis.scale, eleobj[iele], Λe, Xe, Ue, Ae, t, Δt, SP, (dbg..., iele=iele))
+        end
+    else
+        thread_buffers = get_thread_buffers(out)
+        nthreads = Threads.nthreads()
+        
+        for buf in thread_buffers
+            zero!(buf)
+        end
+        
+        Threads.@threads :static for iele = 1:nele
+            tid = Threads.threadid()
+            buf = thread_buffers[tid]
+            
+            index = dis.index[iele]
+            Λe = NTuple{nΛder}(λ[index.X] for λ∈state.Λ)
+            Xe = NTuple{nXder}(x[index.X] for x∈state.X)
+            Ue = NTuple{nUder}(u[index.U] for u∈state.U)
+            Ae = state.A[index.A]
+            
+            addin!{mission}(buf, asm, iele, dis.scale, eleobj[iele], Λe, Xe, Ue, Ae, t, Δt, SP, (dbg..., iele=iele))
+        end
+        
+        reduce_thread_local!(out, thread_buffers)
+    end
+end
+
+"""
+Get thread-local buffers from assembly output.
+"""
+function get_thread_buffers(out::AssemblySweepX)
+    return out.thread_buffers
+end
+
+struct Newmarkβdecrement!{OX} end
 function Newmarkβdecrement!{2}(state,Δx ,Xdofgr,c,firstiter, a,b,x′,x″,Δx′,Δx″,args...) # x′, x″ are just mutable memory, neither input nor output.
     a₁,a₂,a₃,b₁,b₂,b₃ = c.a₁,c.a₂,c.a₃,c.b₁,c.b₂,c.b₃
 
@@ -184,9 +346,9 @@ function solve(SX::Type{SweepX{OX}},pstate,verbose,dbg;
                     saveiter::𝔹=false) where{OX}
                     
     model,dis        = initialstate.model,initialstate.dis
-    out,asm,Xdofgr   = prepare(AssemblySweepX{OX},model,dis)  
+    out,asm,Xdofgr   = prepare(AssemblySweepX{OX},model,dis)
     nXdof            = getndof(Xdofgr)
-    buffer           = ntuple(i->𝕣1(undef,nXdof), 6)  
+    # buffer is now pre-allocated in AssemblySweepX
     citer            = 0
     cΔx²,cLλ²        = maxΔx^2,maxLλ^2
     state            = State{1,OX+1,1}(copy(initialstate)) 
@@ -205,11 +367,12 @@ function solve(SX::Type{SweepX{OX}},pstate,verbose,dbg;
             else           assemble!{:iter}(out,asm,dis,model,state,Δt,(dbg...,solver=:SweepX,step=step,iiter=iiter))
             end
             try if step==1  && firstiter  Lλx = lu(out.Lλx) # here we do not write "local Lλx", so we refer to the variable defined outside the loops (we do not shadow Lλx)
-            else                          lu!(Lλx, out.Lλx) 
+            else                          lu!(Lλx, out.Lλx)
             end catch;    muscadeerror(@sprintf("matrix factorization failed at step=%i, iiter=%i",step,iiter)) end
-            Δx       = Lλx\out.Lλ
+            ldiv!(out.Δx_buffer, Lλx, out.Lλ)  # In-place solve, avoids allocation
+            Δx       = out.Δx_buffer  # Local reference for convenience
             Δx²,Lλ²  = sum(Δx.^2),sum(out.Lλ.^2)
-            Newmarkβdecrement!{OX}(state,Δx ,Xdofgr,out.c,firstiter,buffer...)
+            Newmarkβdecrement!{OX}(state,Δx ,Xdofgr,out.c,firstiter,out.buffer...)
  
             verbose && saveiter && @printf("        iteration %3d, γ= %7.1e\n",iiter,γ)
             saveiter && (states[iiter]=State(state.time,state.Λ,deepcopy(state.X),state.U,state.A,state.SP,model,dis))
